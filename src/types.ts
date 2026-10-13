@@ -4,20 +4,22 @@ type NativeProps = Omit<HTMLAttributes<HTMLDivElement>, "children" | "onChange" 
 
 export type YozoraTheme = "light" | "dark" | "system"
 
-export interface YozoraItem {
+type YozoraTabBase = {
   id: string
   icon: ReactNode
-  label?: ReactNode
+  activeIcon?: ReactNode
   disabled?: boolean
   className?: string
-  "aria-label"?: string
+  controls?: string
 }
+
+export type YozoraTab = YozoraTabBase & ({ label: ReactNode; "aria-label"?: string } | { label?: undefined; "aria-label": string })
 
 export interface YozoraClassNames {
   container?: string
   root?: string
   pill?: string
-  item?: string
+  tab?: string
   icon?: string
   label?: string
 }
@@ -28,10 +30,11 @@ export interface YozoraDrift {
 }
 
 export interface YozoraProps extends NativeProps {
-  items: YozoraItem[]
+  tabs: YozoraTab[]
   value?: string
   defaultValue?: string
   onValueChange?: (id: string) => void
+  semantics?: "navigation" | "tabs"
   theme?: YozoraTheme
   accent?: string
   fullWidth?: boolean

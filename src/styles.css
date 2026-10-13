@@ -76,7 +76,7 @@
   opacity: 0;
 }
 
-[data-yozora-item] {
+[data-yozora-tab] {
   position: relative;
   appearance: none;
   margin: 0;
@@ -89,8 +89,30 @@
   flex: 0 1 auto;
 }
 
-[data-yozora-root][data-full-width="true"] [data-yozora-item] {
+[data-yozora-root][data-full-width="true"] [data-yozora-tab] {
   flex: 1 1 0;
+}
+
+[data-yozora-icon] {
+  display: grid;
+}
+
+[data-yozora-icon] > * {
+  grid-area: 1 / 1;
+  display: grid;
+  transition: opacity 180ms;
+}
+
+[data-yozora-icon-filled] {
+  opacity: 0;
+}
+
+[data-yozora-tab][data-active="true"] [data-yozora-icon-filled] {
+  opacity: 1;
+}
+
+[data-yozora-tab][data-active="true"] [data-yozora-icon][data-swap="true"] [data-yozora-icon-outline] {
+  opacity: 0;
 }
 
 [data-yozora-root][data-styled="true"] {
@@ -164,30 +186,30 @@
   box-shadow: var(--yozora-pill-glow);
 }
 
-[data-yozora-root][data-styled="true"] [data-yozora-item] {
+[data-yozora-root][data-styled="true"] [data-yozora-tab] {
   display: flex;
   flex-direction: column;
   align-items: center;
   gap: 2px;
-  min-width: var(--yozora-item-min, 64px);
-  padding: 5px var(--yozora-item-padding-x, 14px) 4px;
+  min-width: var(--yozora-tab-min, 64px);
+  padding: 5px var(--yozora-tab-padding-x, 14px) 4px;
   border-radius: var(--yozora-radius, 999px);
   transition: color 200ms;
 }
 
-[data-yozora-root][data-styled="true"][data-full-width="true"] [data-yozora-item] {
-  min-width: var(--yozora-item-min, 0px);
+[data-yozora-root][data-styled="true"][data-full-width="true"] [data-yozora-tab] {
+  min-width: var(--yozora-tab-min, 0px);
 }
 
-[data-yozora-root][data-styled="true"] [data-yozora-item][data-active="true"] {
+[data-yozora-root][data-styled="true"] [data-yozora-tab][data-active="true"] {
   color: var(--yozora-accent);
 }
 
-[data-yozora-root][data-styled="true"] [data-yozora-item]:focus-visible {
+[data-yozora-root][data-styled="true"] [data-yozora-tab]:focus-visible {
   box-shadow: 0 0 0 2px var(--yozora-accent);
 }
 
-[data-yozora-root][data-styled="true"] [data-yozora-item][data-disabled="true"] {
+[data-yozora-root][data-styled="true"] [data-yozora-tab][data-disabled="true"] {
   opacity: 0.4;
   cursor: not-allowed;
 }
@@ -202,14 +224,14 @@
   height: var(--yozora-icon-size, 20px);
 }
 
-[data-yozora-root][data-styled="true"] [data-yozora-item][data-active="true"] [data-yozora-icon] {
+[data-yozora-root][data-styled="true"] [data-yozora-tab][data-active="true"] [data-yozora-icon] {
   transform: translateY(-1px) scale(1.08);
 }
 
 @media (prefers-reduced-motion: reduce) {
   [data-yozora-root],
   [data-yozora-pill],
-  [data-yozora-item],
+  [data-yozora-tab],
   [data-yozora-icon] {
     transition-duration: 1ms !important;
   }

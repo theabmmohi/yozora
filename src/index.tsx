@@ -1,10 +1,9 @@
 "use client"
 
-import { haptic, useControllableState, useIsomorphicLayoutEffect } from "./hooks"
+import { haptic, useControllableState, useIsomorphicLayoutEffect, warnMissingName } from "./hooks"
 import { forwardRef, useRef, useState, useCallback, useEffect } from "react"
 import type { CSSProperties, PointerEvent, KeyboardEvent } from "react"
 import type { YozoraProps } from "./types"
-import "./styles.css"
 
 const HOLD_DELAY = 250
 const MOVE_SLOP = 10
@@ -19,6 +18,7 @@ type Gesture = {
   timer: ReturnType<typeof setTimeout> | undefined
   armed: boolean
   base: { cx: number; cy: number; w: number } | null
+  startTab: number
   sx: number
   sy: number
   lx: number
@@ -48,12 +48,23 @@ function resolveDrift(drift: YozoraProps["drift"]) {
   return { x: drift.x ?? DEFAULT_DRIFT_X, y: drift.y ?? DEFAULT_DRIFT_Y }
 }
 
+function liveShift(el: HTMLElement) {
+  try {
+    if (typeof DOMMatrixReadOnly === "undefined") return { x: 0, y: 0 }
+    const m = new DOMMatrixReadOnly(getComputedStyle(el).transform)
+    return { x: m.m41, y: m.m42 }
+  } catch {
+    return { x: 0, y: 0 }
+  }
+}
+
 const Yozora = forwardRef<HTMLDivElement, YozoraProps>(function Yozora(props, forwardedRef) {
   const {
-    items,
+    tabs,
     value: valueProp,
     defaultValue,
     onValueChange,
+    semantics = "navigation",
     theme = "system",
     accent,
     fullWidth = false,
@@ -69,17 +80,23 @@ const Yozora = forwardRef<HTMLDivElement, YozoraProps>(function Yozora(props, fo
     ...rest
   } = props
 
-  const [value, setValue] = useControllableState<string | undefined>({
+  const isTabs = semantics === "tabs"
+
+  const [selected, setSelected] = useControllableState<string | undefined>({
     value: valueProp,
-    defaultValue: defaultValue ?? items[0]?.id,
+    defaultValue,
     onChange: (id) => {
       if (id !== undefined) onValueChange?.(id)
     }
   })
-  const activeIndex = items.findIndex((item) => item.id === value)
+  const firstEnabledId = tabs.find((t) => !t.disabled)?.id
+  const value = valueProp !== undefined ? valueProp : tabs.some((t) => t.id === selected) ? selected : firstEnabledId
+  const activeIndex = tabs.findIndex((t) => t.id === value)
 
   const rootRef = useRef<HTMLDivElement | null>(null)
-  const itemRefs = useRef<(HTMLButtonElement | null)[]>([])
+  const tabRefs = useRef<(HTMLButtonElement | null)[]>([])
+  const tabsRef = useRef(tabs)
+  tabsRef.current = tabs
   const [rects, setRects] = useState<Rect[]>([])
   const [mounted, setMounted] = useState(false)
   const [armed, setArmed] = useState(false)
@@ -91,6 +108,7 @@ const Yozora = forwardRef<HTMLDivElement, YozoraProps>(function Yozora(props, fo
     timer: undefined,
     armed: false,
     base: null,
+    startTab: -1,
     sx: 0,
     sy: 0,
     lx: 0,
@@ -112,20 +130,24 @@ const Yozora = forwardRef<HTMLDivElement, YozoraProps>(function Yozora(props, fo
   )
 
   const measure = useCallback(() => {
-    const next = items.map((_, i) => {
-      const el = itemRefs.current[i]
+    const next = tabsRef.current.map((_, i) => {
+      const el = tabRefs.current[i]
       return el ? { left: el.offsetLeft, width: el.offsetWidth } : { left: 0, width: 0 }
     })
     setRects((prev) => (sameRects(prev, next) ? prev : next))
-  }, [items])
+  }, [])
 
   useIsomorphicLayoutEffect(() => {
     measure()
+  })
+
+  useIsomorphicLayoutEffect(() => {
     if (typeof ResizeObserver === "undefined") return
     const ro = new ResizeObserver(measure)
     if (rootRef.current) ro.observe(rootRef.current)
+    tabRefs.current.slice(0, tabs.length).forEach((el) => el && ro.observe(el))
     return () => ro.disconnect()
-  }, [measure, fullWidth])
+  }, [measure, fullWidth, tabs.length])
 
   useEffect(() => {
     const id = requestAnimationFrame(() => setMounted(true))
@@ -134,10 +156,14 @@ const Yozora = forwardRef<HTMLDivElement, YozoraProps>(function Yozora(props, fo
 
   useEffect(() => () => clearTimeout(st.timer), [st])
 
+  useEffect(() => {
+    tabs.forEach(warnMissingName)
+  }, [tabs])
+
   const commit = (i: number, quiet?: boolean) => {
-    const item = items[i]
-    if (!item || item.disabled || item.id === value) return
-    setValue(item.id)
+    const tab = tabs[i]
+    if (!tab || tab.disabled || tab.id === value) return
+    setSelected(tab.id)
     if (!quiet && haptics) haptic(8)
   }
 
@@ -146,15 +172,16 @@ const Yozora = forwardRef<HTMLDivElement, YozoraProps>(function Yozora(props, fo
     return (clientX - st.base!.cx - st.tx) / scale + st.base!.w / 2
   }
 
-  const tabAt = (lx: number) => rects.findIndex((r, i) => !items[i]?.disabled && lx >= r.left && lx < r.left + r.width)
+  const tabAt = (lx: number) => rects.findIndex((r, i) => !tabs[i]?.disabled && lx >= r.left && lx < r.left + r.width)
+
+  const bounds = () => ({ min: Math.min(...rects.map((r) => r.left)), max: Math.max(...rects.map((r) => r.left + r.width)) })
 
   const track = (cx: number, cy: number) => {
     if (!st.base || !rects.length) return
-    const first = rects[0]
-    const last = rects[rects.length - 1]
+    const { min, max } = bounds()
     const lx = local(cx)
 
-    const i = tabAt(clamp(lx, first.left, last.left + last.width - 0.01))
+    const i = tabAt(clamp(lx, min, max - 0.01))
     if (i !== -1 && i !== st.preview) {
       st.preview = i
       setPreview(i)
@@ -162,7 +189,7 @@ const Yozora = forwardRef<HTMLDivElement, YozoraProps>(function Yozora(props, fo
     }
 
     const w = rects[st.preview]?.width ?? 0
-    setDragX(clamp(lx - st.grab - w / 2, first.left, last.left + last.width - w))
+    setDragX(clamp(lx - st.grab - w / 2, min, max - w))
 
     const d = resolveDrift(drift)
     st.tx = clamp((-(cx - st.base.cx) / DRIFT_RANGE) * d.x, -d.x, d.x)
@@ -175,7 +202,7 @@ const Yozora = forwardRef<HTMLDivElement, YozoraProps>(function Yozora(props, fo
     st.armed = true
     setArmed(true)
     if (quiet !== true && haptics) haptic(14)
-    st.preview = tabAt(local(st.lx))
+    st.preview = st.startTab >= 0 ? st.startTab : tabAt(local(st.lx))
     setPreview(st.preview)
     track(st.lx, st.ly)
   }
@@ -184,6 +211,7 @@ const Yozora = forwardRef<HTMLDivElement, YozoraProps>(function Yozora(props, fo
     clearTimeout(st.timer)
     st.armed = false
     st.base = null
+    st.startTab = -1
     st.tx = 0
     st.ty = 0
     st.preview = -1
@@ -197,24 +225,29 @@ const Yozora = forwardRef<HTMLDivElement, YozoraProps>(function Yozora(props, fo
     if (e.pointerType === "mouse" && e.button !== 0) return
     const el = e.currentTarget
     const r = el.getBoundingClientRect()
+    const live = liveShift(el)
     try {
       el.setPointerCapture(e.pointerId)
     } catch {
       /* ignore */
     }
-    st.base = { cx: r.left + r.width / 2, cy: r.top + r.height / 2, w: el.offsetWidth }
+
+    const target = (e.target as Element).closest?.("[data-yozora-tab]") ?? null
+    const idx = target ? tabRefs.current.indexOf(target as HTMLButtonElement) : -1
+    st.startTab = idx >= 0 && !tabs[idx]?.disabled ? idx : -1
+
+    st.base = { cx: r.left + r.width / 2 - live.x, cy: r.top + r.height / 2 - live.y, w: el.offsetWidth }
     st.sx = st.lx = e.clientX
     st.sy = st.ly = e.clientY
-    st.tx = 0
-    st.ty = 0
+    st.tx = live.x
+    st.ty = live.y
     st.moved = false
     st.grab = 0
     clearTimeout(st.timer)
 
-    const hit = tabAt(local(e.clientX))
-    if (hit !== -1 && hit === activeIndex) {
-      const r0 = rects[hit]
-      st.grab = local(e.clientX) - (r0.left + r0.width / 2)
+    if (st.startTab >= 0 && st.startTab === activeIndex) {
+      const tr = target!.getBoundingClientRect()
+      st.grab = e.clientX - (tr.left + tr.width / 2)
       arm(true)
     } else {
       st.timer = setTimeout(arm, holdDelay)
@@ -227,32 +260,33 @@ const Yozora = forwardRef<HTMLDivElement, YozoraProps>(function Yozora(props, fo
     st.ly = e.clientY
     if (st.armed) track(e.clientX, e.clientY)
     else if (Math.hypot(e.clientX - st.sx, e.clientY - st.sy) > MOVE_SLOP) {
-      st.moved = true
+      st.moved = true 
       clearTimeout(st.timer)
     }
   }
 
-  const onPointerUp = (e: PointerEvent<HTMLDivElement>) => {
-    if (st.armed && st.preview >= 0) commit(st.preview, true)
-    else if (st.base && !st.armed && !st.moved) {
-      const i = tabAt(local(e.clientX))
-      if (i !== -1) commit(i)
-    }
+  const onPointerUp = () => {
+    if (st.armed && st.preview >= 0)
+      commit(st.preview, true)
+    else if (st.base && !st.armed && !st.moved && st.startTab >= 0) commit(st.startTab)
     end()
   }
 
   const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
-    const enabled = items.map((it, i) => (it.disabled ? -1 : i)).filter((i) => i >= 0)
+    const enabled = tabs.map((t, i) => (t.disabled ? -1 : i)).filter((i) => i >= 0)
     if (!enabled.length) return
+    const rtl = getComputedStyle(e.currentTarget).direction === "rtl" || e.currentTarget.closest("[dir='rtl']") !== null
     let next = -1
     if (e.key === "Home") next = enabled[0]
     else if (e.key === "End") next = enabled[enabled.length - 1]
     else if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
-      const dir = e.key === "ArrowRight" ? 1 : -1
-      let i = activeIndex
-      for (let n = 0; n < items.length; n++) {
-        i = (i + dir + items.length) % items.length
-        if (!items[i].disabled) {
+      let dir = e.key === "ArrowRight" ? 1 : -1
+      if (rtl) dir = -dir
+      
+      let i = activeIndex < 0 ? (dir > 0 ? -1 : tabs.length) : activeIndex
+      for (let n = 0; n < tabs.length; n++) {
+        i = (i + dir + tabs.length) % tabs.length
+        if (!tabs[i].disabled) {
           next = i
           break
         }
@@ -260,8 +294,8 @@ const Yozora = forwardRef<HTMLDivElement, YozoraProps>(function Yozora(props, fo
     }
     if (next < 0) return
     e.preventDefault()
-    commit(next)
-    itemRefs.current[next]?.focus()
+    if (isTabs) commit(next)
+    tabRefs.current[next]?.focus()
   }
 
   const shown = preview >= 0 ? preview : activeIndex
@@ -282,7 +316,7 @@ const Yozora = forwardRef<HTMLDivElement, YozoraProps>(function Yozora(props, fo
       <div
         {...rest}
         ref={setRefs}
-        role="tablist"
+        role={isTabs ? "tablist" : "navigation"}
         data-yozora-root=""
         data-styled={!unstyled}
         data-theme={theme}
@@ -298,32 +332,35 @@ const Yozora = forwardRef<HTMLDivElement, YozoraProps>(function Yozora(props, fo
         onKeyDown={onKeyDown}
       >
         <div aria-hidden="true" data-yozora-pill="" data-dragging={dragX !== null} data-empty={!pillRect} className={classNames?.pill} style={{ width: pillRect?.width ?? 0, transform: `translateX(${dragX ?? pillRect?.left ?? 0}px)` }} />
-        {items.map((item, i) => (
+        {tabs.map((tab, i) => (
           <button
-            key={item.id}
+            key={tab.id}
             ref={(el) => {
-              itemRefs.current[i] = el
+              tabRefs.current[i] = el
             }}
             type="button"
-            role="tab"
-            aria-selected={i === activeIndex}
-            aria-disabled={item.disabled || undefined}
-            aria-label={item["aria-label"]}
-            tabIndex={i === (activeIndex >= 0 ? activeIndex : 0) ? 0 : -1}
-            data-yozora-item=""
+            role={isTabs ? "tab" : undefined}
+            aria-selected={isTabs ? i === activeIndex : undefined}
+            aria-current={!isTabs && i === activeIndex ? "page" : undefined}
+            aria-controls={isTabs ? tab.controls : undefined}
+            aria-disabled={tab.disabled || undefined}
+            aria-label={tab["aria-label"]}
+            tabIndex={isTabs ? (i === (activeIndex >= 0 ? activeIndex : 0) ? 0 : -1) : undefined}
+            data-yozora-tab=""
             data-active={i === shown}
-            data-disabled={item.disabled || undefined}
-            className={cn(classNames?.item, item.className)}
+            data-disabled={tab.disabled || undefined}
+            className={cn(classNames?.tab, tab.className)}
             onClick={(e) => {
               if (e.detail === 0) commit(i)
             }}
           >
-            <span data-yozora-icon="" className={classNames?.icon}>
-              {item.icon}
+            <span data-yozora-icon="" aria-hidden="true" data-swap={tab.activeIcon != null ? "true" : undefined} className={classNames?.icon}>
+              <span data-yozora-icon-outline="">{tab.icon}</span>
+              {tab.activeIcon != null && <span data-yozora-icon-filled="">{tab.activeIcon}</span>}
             </span>
-            {item.label != null && (
+            {tab.label != null && (
               <span data-yozora-label="" className={classNames?.label}>
-                {item.label}
+                {tab.label}
               </span>
             )}
           </button>
@@ -335,5 +372,5 @@ const Yozora = forwardRef<HTMLDivElement, YozoraProps>(function Yozora(props, fo
 
 Yozora.displayName = "Yozora"
 
-export type { YozoraProps, YozoraItem, YozoraClassNames, YozoraDrift, YozoraTheme } from "./types"
+export type { YozoraProps, YozoraTab, YozoraClassNames, YozoraDrift, YozoraTheme } from "./types"
 export { Yozora }
