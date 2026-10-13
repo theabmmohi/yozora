@@ -46,6 +46,7 @@
   "scripts": {
     "dev": "bunchee --watch",
     "build": "bunchee && cp src/styles.css dist/styles.css",
+    "test": "echo \"Still No Test\"",
     "typecheck": "tsc --noEmit",
     "format": "prettier --write .",
     "prepublishOnly": "npm run typecheck && npm run build"
