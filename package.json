@@ -1,6 +1,6 @@
 {
   "name": "yozora",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "A fluid, draggable floating tab bar for React.",
   "license": "MIT",
   "keywords": [
@@ -33,7 +33,10 @@
         "default": "./dist/index.cjs"
       }
     },
-    "./styles": "./dist/styles.css"
+    "./styles": {
+      "types": "./dist/styles.d.ts",
+      "default": "./dist/styles.css"
+    }
   },
   "sideEffects": [
     "**/*.css"
@@ -50,7 +53,7 @@
   },
   "scripts": {
     "dev": "bunchee --watch",
-    "build": "bunchee && cp src/styles.css dist/styles.css",
+    "build": "bunchee && cp src/styles.css dist/styles.css && echo 'export {}' > dist/styles.d.ts",
     "test": "vitest run",
     "test:dist": "node scripts/smoke.mjs",
     "typecheck": "tsc --noEmit",

@@ -1,45 +1,64 @@
 "use client"
 
+import { MAX_RELEASE_VELOCITY, RUBBER_BAND, isSettled, squashAgainstWalls, stepSpring } from "./physics"
 import { haptic, useControllableState, useIsomorphicLayoutEffect, warnMissingName } from "./hooks"
 import { forwardRef, useRef, useState, useCallback, useEffect } from "react"
 import type { CSSProperties, PointerEvent, KeyboardEvent } from "react"
+import type { SpringState } from "./physics"
 import type { YozoraProps } from "./types"
 
 const HOLD_DELAY = 250
-const MOVE_SLOP = 10
+const MOVE_TOLERANCE = 10
 const ARMED_SCALE = 1.02
 const DRIFT_RANGE = 160
-const DEFAULT_DRIFT_X = 5
-const DEFAULT_DRIFT_Y = 7
+const DEFAULT_DRIFT_X = 3
+const DEFAULT_DRIFT_Y = 5
+const DEFAULT_HAPTIC_TICK_DURATION = 50
+const DEFAULT_HAPTIC_ARM_DURATION = 75
 
 type Rect = { left: number; width: number }
 
+type PillMotion = {
+  left: SpringState
+  width: SpringState
+  targetLeft: number
+  targetWidth: number
+  wallLeft: number
+  wallRight: number
+  dragging: boolean
+  initialized: boolean
+  frameId: number
+  lastTime: number
+}
+
 type Gesture = {
-  timer: ReturnType<typeof setTimeout> | undefined
+  holdTimer: ReturnType<typeof setTimeout> | undefined
   armed: boolean
-  base: { cx: number; cy: number; w: number } | null
-  startTab: number
-  sx: number
-  sy: number
-  lx: number
-  ly: number
-  tx: number
-  ty: number
-  grab: number
-  moved: boolean
-  preview: number
+  barMetrics: { centerX: number; centerY: number; width: number } | null
+  startTabIndex: number
+  startX: number
+  startY: number
+  lastX: number
+  lastY: number
+  driftX: number
+  driftY: number
+  grabOffset: number
+  hasMoved: boolean
+  previewIndex: number
+  sampleTime: number
+  releaseVelocity: number
 }
 
-function cn(...classes: (string | undefined | false)[]) {
-  return classes.filter(Boolean).join(" ") || undefined
+function joinClassNames(...classNames: (string | undefined | false)[]) {
+  return classNames.filter(Boolean).join(" ") || undefined
 }
 
-function clamp(v: number, min: number, max: number) {
-  return Math.min(max, Math.max(min, v))
+function clamp(value: number, minimum: number, maximum: number) {
+  return Math.min(maximum, Math.max(minimum, value))
 }
 
-function sameRects(a: Rect[], b: Rect[]) {
-  return a.length === b.length && a.every((r, i) => r.left === b[i].left && r.width === b[i].width)
+function areRectsEqual(previousRects: Rect[], nextRects: Rect[]) {
+  return previousRects.length === nextRects.length && previousRects.every((rect, index) => rect.left === nextRects[index].left && rect.width === nextRects[index].width)
 }
 
 function resolveDrift(drift: YozoraProps["drift"]) {
@@ -48,11 +67,17 @@ function resolveDrift(drift: YozoraProps["drift"]) {
   return { x: drift.x ?? DEFAULT_DRIFT_X, y: drift.y ?? DEFAULT_DRIFT_Y }
 }
 
-function liveShift(el: HTMLElement) {
+function resolveHaptics(haptics: YozoraProps["haptics"]) {
+  if (haptics === false) return null
+  if (haptics === true || haptics === undefined) return { tick: DEFAULT_HAPTIC_TICK_DURATION, arm: DEFAULT_HAPTIC_ARM_DURATION }
+  return { tick: haptics.tick ?? DEFAULT_HAPTIC_TICK_DURATION, arm: haptics.arm ?? DEFAULT_HAPTIC_ARM_DURATION }
+}
+
+function readLiveShift(element: HTMLElement) {
   try {
     if (typeof DOMMatrixReadOnly === "undefined") return { x: 0, y: 0 }
-    const m = new DOMMatrixReadOnly(getComputedStyle(el).transform)
-    return { x: m.m41, y: m.m42 }
+    const matrix = new DOMMatrixReadOnly(getComputedStyle(element).transform)
+    return { x: matrix.m41, y: matrix.m42 }
   } catch {
     return { x: 0, y: 0 }
   }
@@ -77,64 +102,114 @@ const Yozora = forwardRef<HTMLDivElement, YozoraProps>(function Yozora(props, fo
     haptics = true,
     className,
     style,
-    ...rest
+    ...restProps
   } = props
 
-  const isTabs = semantics === "tabs"
+  const isTabsSemantics = semantics === "tabs"
+  const hapticDurations = resolveHaptics(haptics)
 
-  const [selected, setSelected] = useControllableState<string | undefined>({
+  const [selectedId, setSelectedId] = useControllableState<string | undefined>({
     value: valueProp,
     defaultValue,
-    onChange: (id) => {
-      if (id !== undefined) onValueChange?.(id)
+    onChange: (nextId) => {
+      if (nextId !== undefined) onValueChange?.(nextId)
     }
   })
-  const firstEnabledId = tabs.find((t) => !t.disabled)?.id
-  const value = valueProp !== undefined ? valueProp : tabs.some((t) => t.id === selected) ? selected : firstEnabledId
-  const activeIndex = tabs.findIndex((t) => t.id === value)
+  const firstEnabledId = tabs.find((tab) => !tab.disabled)?.id
+  const value = valueProp !== undefined ? valueProp : tabs.some((tab) => tab.id === selectedId) ? selectedId : firstEnabledId
+  const activeIndex = tabs.findIndex((tab) => tab.id === value)
 
   const rootRef = useRef<HTMLDivElement | null>(null)
   const tabRefs = useRef<(HTMLButtonElement | null)[]>([])
-  const tabsRef = useRef(tabs)
-  tabsRef.current = tabs
-  const [rects, setRects] = useState<Rect[]>([])
+  const latestTabsRef = useRef(tabs)
+  latestTabsRef.current = tabs
+  const [tabRects, setTabRects] = useState<Rect[]>([])
   const [mounted, setMounted] = useState(false)
   const [armed, setArmed] = useState(false)
-  const [dragX, setDragX] = useState<number | null>(null)
-  const [shift, setShift] = useState({ x: 0, y: 0 })
-  const [preview, setPreview] = useState(-1)
+  const [barShift, setBarShift] = useState({ x: 0, y: 0 })
+  const [previewIndex, setPreviewIndex] = useState(-1)
 
-  const st = useRef<Gesture>({
-    timer: undefined,
+  const gesture = useRef<Gesture>({
+    holdTimer: undefined,
     armed: false,
-    base: null,
-    startTab: -1,
-    sx: 0,
-    sy: 0,
-    lx: 0,
-    ly: 0,
-    tx: 0,
-    ty: 0,
-    grab: 0,
-    moved: false,
-    preview: -1
+    barMetrics: null,
+    startTabIndex: -1,
+    startX: 0,
+    startY: 0,
+    lastX: 0,
+    lastY: 0,
+    driftX: 0,
+    driftY: 0,
+    grabOffset: 0,
+    hasMoved: false,
+    previewIndex: -1,
+    sampleTime: 0,
+    releaseVelocity: 0
   }).current
 
-  const setRefs = useCallback(
-    (el: HTMLDivElement | null) => {
-      rootRef.current = el
-      if (typeof forwardedRef === "function") forwardedRef(el)
-      else if (forwardedRef) forwardedRef.current = el
+  const pillRef = useRef<HTMLDivElement | null>(null)
+  const pillMotion = useRef<PillMotion>({
+    left: { position: 0, velocity: 0 },
+    width: { position: 0, velocity: 0 },
+    targetLeft: 0,
+    targetWidth: 0,
+    wallLeft: 0,
+    wallRight: 0,
+    dragging: false,
+    initialized: false,
+    frameId: 0,
+    lastTime: 0
+  }).current
+
+  const paintPill = useCallback(() => {
+    const pillElement = pillRef.current
+    if (!pillElement) return
+    const squashed = squashAgainstWalls(pillMotion.left.position, pillMotion.width.position, pillMotion.wallLeft, pillMotion.wallRight)
+    pillElement.style.width = `${squashed.width}px`
+    pillElement.style.transform = `translate3d(${squashed.left}px, 0, 0) scaleY(${squashed.scaleY})`
+  }, [pillMotion])
+
+  const runPillMotion = useCallback(() => {
+    if (pillMotion.frameId) return
+    pillMotion.lastTime = performance.now()
+    const tick = (now: number) => {
+      const deltaTime = Math.min((now - pillMotion.lastTime) / 1000, 1 / 30)
+      pillMotion.lastTime = now
+      if (!pillMotion.dragging) stepSpring(pillMotion.left, pillMotion.targetLeft, deltaTime)
+      stepSpring(pillMotion.width, pillMotion.targetWidth, deltaTime)
+      const leftSettled = pillMotion.dragging || isSettled(pillMotion.left, pillMotion.targetLeft)
+      const widthSettled = isSettled(pillMotion.width, pillMotion.targetWidth)
+      if (leftSettled && !pillMotion.dragging) {
+        pillMotion.left.position = pillMotion.targetLeft
+        pillMotion.left.velocity = 0
+      }
+      if (widthSettled) {
+        pillMotion.width.position = pillMotion.targetWidth
+        pillMotion.width.velocity = 0
+      }
+      paintPill()
+      pillMotion.frameId = leftSettled && widthSettled ? 0 : requestAnimationFrame(tick)
+    }
+    pillMotion.frameId = requestAnimationFrame(tick)
+  }, [pillMotion, paintPill])
+
+  useEffect(() => () => cancelAnimationFrame(pillMotion.frameId), [pillMotion])
+
+  const setRootElement = useCallback(
+    (element: HTMLDivElement | null) => {
+      rootRef.current = element
+      if (typeof forwardedRef === "function") forwardedRef(element)
+      else if (forwardedRef) forwardedRef.current = element
     },
     [forwardedRef]
   )
 
   const measure = useCallback(() => {
-    const next = tabsRef.current.map((_, i) => {
-      const el = tabRefs.current[i]
-      return el ? { left: el.offsetLeft, width: el.offsetWidth } : { left: 0, width: 0 }
+    const nextRects = latestTabsRef.current.map((_tab, index) => {
+      const tabElement = tabRefs.current[index]
+      return tabElement ? { left: tabElement.offsetLeft, width: tabElement.offsetWidth } : { left: 0, width: 0 }
     })
-    setRects((prev) => (sameRects(prev, next) ? prev : next))
+    setTabRects((previousRects) => (areRectsEqual(previousRects, nextRects) ? previousRects : nextRects))
   }, [])
 
   useIsomorphicLayoutEffect(() => {
@@ -143,168 +218,211 @@ const Yozora = forwardRef<HTMLDivElement, YozoraProps>(function Yozora(props, fo
 
   useIsomorphicLayoutEffect(() => {
     if (typeof ResizeObserver === "undefined") return
-    const ro = new ResizeObserver(measure)
-    if (rootRef.current) ro.observe(rootRef.current)
-    tabRefs.current.slice(0, tabs.length).forEach((el) => el && ro.observe(el))
-    return () => ro.disconnect()
+    const resizeObserver = new ResizeObserver(measure)
+    if (rootRef.current) resizeObserver.observe(rootRef.current)
+    tabRefs.current.slice(0, tabs.length).forEach((tabElement) => tabElement && resizeObserver.observe(tabElement))
+    return () => resizeObserver.disconnect()
   }, [measure, fullWidth, tabs.length])
 
   useEffect(() => {
-    const id = requestAnimationFrame(() => setMounted(true))
-    return () => cancelAnimationFrame(id)
+    const frameId = requestAnimationFrame(() => setMounted(true))
+    return () => cancelAnimationFrame(frameId)
   }, [])
 
-  useEffect(() => () => clearTimeout(st.timer), [st])
+  useEffect(() => () => clearTimeout(gesture.holdTimer), [gesture])
 
   useEffect(() => {
     tabs.forEach(warnMissingName)
   }, [tabs])
 
-  const commit = (i: number, quiet?: boolean) => {
-    const tab = tabs[i]
+  const commit = (tabIndex: number, quiet?: boolean) => {
+    const tab = tabs[tabIndex]
     if (!tab || tab.disabled || tab.id === value) return
-    setSelected(tab.id)
-    if (!quiet && haptics) haptic(8)
+    setSelectedId(tab.id)
+    if (!quiet && hapticDurations) haptic(hapticDurations.tick)
   }
 
-  const local = (clientX: number) => {
-    const scale = st.armed ? ARMED_SCALE : 1
-    return (clientX - st.base!.cx - st.tx) / scale + st.base!.w / 2
+  const toLocalX = (clientX: number) => {
+    const scale = gesture.armed ? ARMED_SCALE : 1
+    return (clientX - gesture.barMetrics!.centerX - gesture.driftX) / scale + gesture.barMetrics!.width / 2
   }
 
-  const tabAt = (lx: number) => rects.findIndex((r, i) => !tabs[i]?.disabled && lx >= r.left && lx < r.left + r.width)
+  const tabIndexAtX = (localX: number) => tabRects.findIndex((rect, index) => !tabs[index]?.disabled && localX >= rect.left && localX < rect.left + rect.width)
 
-  const bounds = () => ({ min: Math.min(...rects.map((r) => r.left)), max: Math.max(...rects.map((r) => r.left + r.width)) })
+  const getTabBounds = () => ({
+    leftEdge: Math.min(...tabRects.map((rect) => rect.left)),
+    rightEdge: Math.max(...tabRects.map((rect) => rect.left + rect.width))
+  })
 
-  const track = (cx: number, cy: number) => {
-    if (!st.base || !rects.length) return
-    const { min, max } = bounds()
-    const lx = local(cx)
+  const trackPointer = (pointerX: number, pointerY: number) => {
+    if (!gesture.barMetrics || !tabRects.length) return
+    const { leftEdge, rightEdge } = getTabBounds()
+    const localX = toLocalX(pointerX)
 
-    const i = tabAt(clamp(lx, min, max - 0.01))
-    if (i !== -1 && i !== st.preview) {
-      st.preview = i
-      setPreview(i)
-      if (haptics) haptic(8)
+    const hoveredTabIndex = tabIndexAtX(clamp(localX, leftEdge, rightEdge - 0.01))
+    if (hoveredTabIndex !== -1 && hoveredTabIndex !== gesture.previewIndex) {
+      gesture.previewIndex = hoveredTabIndex
+      setPreviewIndex(hoveredTabIndex)
+      if (hapticDurations) haptic(hapticDurations.tick)
     }
 
-    const w = rects[st.preview]?.width ?? 0
-    setDragX(clamp(lx - st.grab - w / 2, min, max - w))
+    const pillWidth = tabRects[gesture.previewIndex]?.width ?? 0
+    const maxLeft = rightEdge - pillWidth
+    let draggedLeft = localX - gesture.grabOffset - pillWidth / 2
+    if (draggedLeft < leftEdge) draggedLeft = leftEdge + (draggedLeft - leftEdge) * RUBBER_BAND
+    else if (draggedLeft > maxLeft) draggedLeft = maxLeft + (draggedLeft - maxLeft) * RUBBER_BAND
 
-    const d = resolveDrift(drift)
-    st.tx = clamp((-(cx - st.base.cx) / DRIFT_RANGE) * d.x, -d.x, d.x)
-    st.ty = clamp((-(cy - st.base.cy) / DRIFT_RANGE) * d.y, -d.y, d.y)
-    setShift({ x: st.tx, y: st.ty })
+    const now = performance.now()
+    const elapsed = Math.max(now - gesture.sampleTime, 1)
+    gesture.releaseVelocity = 0.6 * gesture.releaseVelocity + 0.4 * ((draggedLeft - pillMotion.left.position) / elapsed) * 1000
+    gesture.sampleTime = now
+    pillMotion.left.position = draggedLeft
+    pillMotion.left.velocity = 0
+    paintPill()
+
+    const maxDrift = resolveDrift(drift)
+    gesture.driftX = clamp((-(pointerX - gesture.barMetrics.centerX) / DRIFT_RANGE) * maxDrift.x, -maxDrift.x, maxDrift.x)
+    gesture.driftY = clamp((-(pointerY - gesture.barMetrics.centerY) / DRIFT_RANGE) * maxDrift.y, -maxDrift.y, maxDrift.y)
+    setBarShift({ x: gesture.driftX, y: gesture.driftY })
   }
 
   const arm = (quiet?: boolean) => {
-    if (st.armed || !st.base) return
-    st.armed = true
+    if (gesture.armed || !gesture.barMetrics) return
+    gesture.armed = true
+    gesture.sampleTime = performance.now()
+    gesture.releaseVelocity = 0
+    pillMotion.dragging = true
     setArmed(true)
-    if (quiet !== true && haptics) haptic(14)
-    st.preview = st.startTab >= 0 ? st.startTab : tabAt(local(st.lx))
-    setPreview(st.preview)
-    track(st.lx, st.ly)
+    if (quiet !== true && hapticDurations) haptic(hapticDurations.arm)
+    gesture.previewIndex = gesture.startTabIndex >= 0 ? gesture.startTabIndex : tabIndexAtX(toLocalX(gesture.lastX))
+    setPreviewIndex(gesture.previewIndex)
+    trackPointer(gesture.lastX, gesture.lastY)
   }
 
-  const end = () => {
-    clearTimeout(st.timer)
-    st.armed = false
-    st.base = null
-    st.startTab = -1
-    st.tx = 0
-    st.ty = 0
-    st.preview = -1
+  const endGesture = () => {
+    clearTimeout(gesture.holdTimer)
+    if (gesture.armed) pillMotion.left.velocity = clamp(gesture.releaseVelocity, -MAX_RELEASE_VELOCITY, MAX_RELEASE_VELOCITY)
+    pillMotion.dragging = false
+    gesture.releaseVelocity = 0
+    gesture.armed = false
+    gesture.barMetrics = null
+    gesture.startTabIndex = -1
+    gesture.driftX = 0
+    gesture.driftY = 0
+    gesture.previewIndex = -1
     setArmed(false)
-    setDragX(null)
-    setShift({ x: 0, y: 0 })
-    setPreview(-1)
+    setBarShift({ x: 0, y: 0 })
+    setPreviewIndex(-1)
+    runPillMotion()
   }
 
-  const onPointerDown = (e: PointerEvent<HTMLDivElement>) => {
-    if (e.pointerType === "mouse" && e.button !== 0) return
-    const el = e.currentTarget
-    const r = el.getBoundingClientRect()
-    const live = liveShift(el)
+  const onPointerDown = (event: PointerEvent<HTMLDivElement>) => {
+    if (event.pointerType === "mouse" && event.button !== 0) return
+    const barElement = event.currentTarget
+    const barRect = barElement.getBoundingClientRect()
+    const liveBarShift = readLiveShift(barElement)
     try {
-      el.setPointerCapture(e.pointerId)
+      barElement.setPointerCapture(event.pointerId)
     } catch {
       /* ignore */
     }
 
-    const target = (e.target as Element).closest?.("[data-yozora-tab]") ?? null
-    const idx = target ? tabRefs.current.indexOf(target as HTMLButtonElement) : -1
-    st.startTab = idx >= 0 && !tabs[idx]?.disabled ? idx : -1
+    const pressedTabElement = (event.target as Element).closest?.("[data-yozora-tab]") ?? null
+    const pressedTabIndex = pressedTabElement ? tabRefs.current.indexOf(pressedTabElement as HTMLButtonElement) : -1
+    gesture.startTabIndex = pressedTabIndex >= 0 && !tabs[pressedTabIndex]?.disabled ? pressedTabIndex : -1
 
-    st.base = { cx: r.left + r.width / 2 - live.x, cy: r.top + r.height / 2 - live.y, w: el.offsetWidth }
-    st.sx = st.lx = e.clientX
-    st.sy = st.ly = e.clientY
-    st.tx = live.x
-    st.ty = live.y
-    st.moved = false
-    st.grab = 0
-    clearTimeout(st.timer)
+    gesture.barMetrics = {
+      centerX: barRect.left + barRect.width / 2 - liveBarShift.x,
+      centerY: barRect.top + barRect.height / 2 - liveBarShift.y,
+      width: barElement.offsetWidth
+    }
+    gesture.startX = gesture.lastX = event.clientX
+    gesture.startY = gesture.lastY = event.clientY
+    gesture.driftX = liveBarShift.x
+    gesture.driftY = liveBarShift.y
+    gesture.hasMoved = false
+    gesture.grabOffset = 0
+    clearTimeout(gesture.holdTimer)
 
-    if (st.startTab >= 0 && st.startTab === activeIndex) {
-      const tr = target!.getBoundingClientRect()
-      st.grab = e.clientX - (tr.left + tr.width / 2)
+    if (gesture.startTabIndex >= 0 && gesture.startTabIndex === activeIndex) {
+      const pressedTabRect = pressedTabElement!.getBoundingClientRect()
+      gesture.grabOffset = event.clientX - (pressedTabRect.left + pressedTabRect.width / 2)
       arm(true)
     } else {
-      st.timer = setTimeout(arm, holdDelay)
+      gesture.holdTimer = setTimeout(arm, holdDelay)
     }
   }
 
-  const onPointerMove = (e: PointerEvent<HTMLDivElement>) => {
-    if (!st.base) return
-    st.lx = e.clientX
-    st.ly = e.clientY
-    if (st.armed) track(e.clientX, e.clientY)
-    else if (Math.hypot(e.clientX - st.sx, e.clientY - st.sy) > MOVE_SLOP) {
-      st.moved = true 
-      clearTimeout(st.timer)
+  const onPointerMove = (event: PointerEvent<HTMLDivElement>) => {
+    if (!gesture.barMetrics) return
+    gesture.lastX = event.clientX
+    gesture.lastY = event.clientY
+    if (gesture.armed) trackPointer(event.clientX, event.clientY)
+    else if (Math.hypot(event.clientX - gesture.startX, event.clientY - gesture.startY) > MOVE_TOLERANCE) {
+      gesture.hasMoved = true
+      clearTimeout(gesture.holdTimer)
     }
   }
 
   const onPointerUp = () => {
-    if (st.armed && st.preview >= 0)
-      commit(st.preview, true)
-    else if (st.base && !st.armed && !st.moved && st.startTab >= 0) commit(st.startTab)
-    end()
+    if (gesture.armed && gesture.previewIndex >= 0) commit(gesture.previewIndex, true)
+    else if (gesture.barMetrics && !gesture.armed && !gesture.hasMoved && gesture.startTabIndex >= 0) commit(gesture.startTabIndex)
+    endGesture()
   }
 
-  const onKeyDown = (e: KeyboardEvent<HTMLDivElement>) => {
-    const enabled = tabs.map((t, i) => (t.disabled ? -1 : i)).filter((i) => i >= 0)
-    if (!enabled.length) return
-    const rtl = getComputedStyle(e.currentTarget).direction === "rtl" || e.currentTarget.closest("[dir='rtl']") !== null
-    let next = -1
-    if (e.key === "Home") next = enabled[0]
-    else if (e.key === "End") next = enabled[enabled.length - 1]
-    else if (e.key === "ArrowRight" || e.key === "ArrowLeft") {
-      let dir = e.key === "ArrowRight" ? 1 : -1
-      if (rtl) dir = -dir
-      
-      let i = activeIndex < 0 ? (dir > 0 ? -1 : tabs.length) : activeIndex
-      for (let n = 0; n < tabs.length; n++) {
-        i = (i + dir + tabs.length) % tabs.length
-        if (!tabs[i].disabled) {
-          next = i
+  const onKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    const enabledTabIndexes = tabs.map((tab, tabIndex) => (tab.disabled ? -1 : tabIndex)).filter((tabIndex) => tabIndex >= 0)
+    if (!enabledTabIndexes.length) return
+    const isRightToLeft = getComputedStyle(event.currentTarget).direction === "rtl" || event.currentTarget.closest("[dir='rtl']") !== null
+    let nextIndex = -1
+    if (event.key === "Home") nextIndex = enabledTabIndexes[0]
+    else if (event.key === "End") nextIndex = enabledTabIndexes[enabledTabIndexes.length - 1]
+    else if (event.key === "ArrowRight" || event.key === "ArrowLeft") {
+      let direction = event.key === "ArrowRight" ? 1 : -1
+      if (isRightToLeft) direction = -direction
+
+      let candidateIndex = activeIndex < 0 ? (direction > 0 ? -1 : tabs.length) : activeIndex
+      for (let attempt = 0; attempt < tabs.length; attempt++) {
+        candidateIndex = (candidateIndex + direction + tabs.length) % tabs.length
+        if (!tabs[candidateIndex].disabled) {
+          nextIndex = candidateIndex
           break
         }
       }
     }
-    if (next < 0) return
-    e.preventDefault()
-    if (isTabs) commit(next)
-    tabRefs.current[next]?.focus()
+    if (nextIndex < 0) return
+    event.preventDefault()
+    if (isTabsSemantics) commit(nextIndex)
+    tabRefs.current[nextIndex]?.focus()
   }
 
-  const shown = preview >= 0 ? preview : activeIndex
-  const pillRect = rects[shown]
+  const displayedIndex = previewIndex >= 0 ? previewIndex : activeIndex
+  const pillRect = tabRects[displayedIndex]
+
+  useIsomorphicLayoutEffect(() => {
+    if (tabRects.length) {
+      const { leftEdge, rightEdge } = getTabBounds()
+      pillMotion.wallLeft = leftEdge
+      pillMotion.wallRight = rightEdge
+    }
+    if (!pillRect) return
+    pillMotion.targetLeft = pillRect.left
+    pillMotion.targetWidth = pillRect.width
+    const reduceMotion = typeof window.matchMedia === "function" && window.matchMedia("(prefers-reduced-motion: reduce)").matches
+    if (!pillMotion.initialized || reduceMotion) {
+      pillMotion.left = { position: pillRect.left, velocity: 0 }
+      pillMotion.width = { position: pillRect.width, velocity: 0 }
+      pillMotion.initialized = true
+      paintPill()
+      return
+    }
+    runPillMotion()
+  }, [pillRect?.left, pillRect?.width, tabRects])
 
   const rootStyle = {
     ...style,
     ...(accent ? { "--yozora-accent": accent } : null),
-    transform: `translate(${shift.x}px, ${shift.y}px) scale(${armed ? ARMED_SCALE : 1})`
+    transform: `translate(${barShift.x}px, ${barShift.y}px) scale(${armed ? ARMED_SCALE : 1})`
   } as CSSProperties
 
   const containerStyle = {
@@ -312,46 +430,46 @@ const Yozora = forwardRef<HTMLDivElement, YozoraProps>(function Yozora(props, fo
   } as CSSProperties
 
   return (
-    <div data-yozora-container="" data-position={position} className={cn(classNames?.container)} style={containerStyle}>
+    <div data-yozora-container="" data-position={position} className={joinClassNames(classNames?.container)} style={containerStyle}>
       <div
-        {...rest}
-        ref={setRefs}
-        role={isTabs ? "tablist" : "navigation"}
+        {...restProps}
+        ref={setRootElement}
+        role={isTabsSemantics ? "tablist" : "navigation"}
         data-yozora-root=""
         data-styled={!unstyled}
         data-theme={theme}
         data-full-width={fullWidth}
         data-armed={armed}
         data-mounted={mounted}
-        className={cn(className, classNames?.root)}
+        className={joinClassNames(className, classNames?.root)}
         style={rootStyle}
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
         onPointerUp={onPointerUp}
-        onPointerCancel={end}
+        onPointerCancel={endGesture}
         onKeyDown={onKeyDown}
       >
-        <div aria-hidden="true" data-yozora-pill="" data-dragging={dragX !== null} data-empty={!pillRect} className={classNames?.pill} style={{ width: pillRect?.width ?? 0, transform: `translateX(${dragX ?? pillRect?.left ?? 0}px)` }} />
-        {tabs.map((tab, i) => (
+        <div ref={pillRef} aria-hidden="true" data-yozora-pill="" data-dragging={armed} data-empty={!pillRect} className={classNames?.pill} />
+        {tabs.map((tab, index) => (
           <button
             key={tab.id}
-            ref={(el) => {
-              tabRefs.current[i] = el
+            ref={(buttonElement) => {
+              tabRefs.current[index] = buttonElement
             }}
             type="button"
-            role={isTabs ? "tab" : undefined}
-            aria-selected={isTabs ? i === activeIndex : undefined}
-            aria-current={!isTabs && i === activeIndex ? "page" : undefined}
-            aria-controls={isTabs ? tab.controls : undefined}
+            role={isTabsSemantics ? "tab" : undefined}
+            aria-selected={isTabsSemantics ? index === activeIndex : undefined}
+            aria-current={!isTabsSemantics && index === activeIndex ? "page" : undefined}
+            aria-controls={isTabsSemantics ? tab.controls : undefined}
             aria-disabled={tab.disabled || undefined}
             aria-label={tab["aria-label"]}
-            tabIndex={isTabs ? (i === (activeIndex >= 0 ? activeIndex : 0) ? 0 : -1) : undefined}
+            tabIndex={isTabsSemantics ? (index === (activeIndex >= 0 ? activeIndex : 0) ? 0 : -1) : undefined}
             data-yozora-tab=""
-            data-active={i === shown}
+            data-active={index === displayedIndex}
             data-disabled={tab.disabled || undefined}
-            className={cn(classNames?.tab, tab.className)}
-            onClick={(e) => {
-              if (e.detail === 0) commit(i)
+            className={joinClassNames(classNames?.tab, tab.className)}
+            onClick={(event) => {
+              if (event.detail === 0) commit(index)
             }}
           >
             <span data-yozora-icon="" aria-hidden="true" data-swap={tab.activeIcon != null ? "true" : undefined} className={classNames?.icon}>
@@ -372,5 +490,5 @@ const Yozora = forwardRef<HTMLDivElement, YozoraProps>(function Yozora(props, fo
 
 Yozora.displayName = "Yozora"
 
-export type { YozoraProps, YozoraTab, YozoraClassNames, YozoraDrift, YozoraTheme } from "./types"
+export type { YozoraProps, YozoraTab, YozoraClassNames, YozoraDrift, YozoraHaptics, YozoraTheme } from "./types"
 export { Yozora }

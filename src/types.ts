@@ -29,6 +29,11 @@ export interface YozoraDrift {
   y?: number
 }
 
+export interface YozoraHaptics {
+  tick?: number
+  arm?: number
+}
+
 export interface YozoraProps extends NativeProps {
   tabs: YozoraTab[]
   value?: string
@@ -44,5 +49,5 @@ export interface YozoraProps extends NativeProps {
   unstyled?: boolean
   holdDelay?: number
   drift?: boolean | YozoraDrift
-  haptics?: boolean
+  haptics?: boolean | YozoraHaptics
 }
