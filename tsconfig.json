@@ -16,8 +16,7 @@
     "noFallthroughCasesInSwitch": true,
     "noImplicitOverride": true,
     "skipLibCheck": true,
-    "noEmit": true,
-    "noUncheckedSideEffectImports": false
+    "noEmit": true
   },
-  "include": ["src"]
+  "include": ["src", "test"]
 }
